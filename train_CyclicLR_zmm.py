@@ -1,30 +1,41 @@
 import os
-# os.environ['CUDA_VISIBLE_DEVICES'] =  '6'
+# os.environ['CUDA_VISIBLE_DEVICES'] =  '4,5,6,7' #'3,2,1,0'
 import sys
 sys.path.append("..")
 import argparse
-from process.data_fusion import *
+from process.data import *
 from process.augmentation import *
 from metric import *
 from loss.cyclic_lr import CosineAnnealingLR_with_Restart
 
-def get_model(model_name, num_class):
+def get_model(model_name, num_class,is_first_bn):
     if model_name == 'baseline':
-        from model_fusion.model_baseline_SEFusion import FusionNet
+        from model.model_baseline import Net
     elif model_name == 'model_A':
-        from model_fusion.FaceBagNet_model_A_SEFusion import FusionNet
+        from model.FaceBagNet_model_A import Net
     elif model_name == 'model_B':
-        from model_fusion.FaceBagNet_model_B_SEFusion import FusionNet
+        from model.FaceBagNet_model_B import Net
+    elif model_name == 'model_C':
+        from model.FaceBagNet_model_C import Net
 
-    net = FusionNet(num_class=num_class)
+    net = Net(num_class=num_class,is_first_bn=is_first_bn)
     return net
+
+def get_augment(image_mode):
+    if image_mode == 'color':
+        augment = color_augumentor
+    elif image_mode == 'depth':
+        augment = depth_augumentor
+    elif image_mode == 'ir':
+        augment = ir_augumentor
+    return augment
 
 def run_train(config):
     out_dir = './models'
     config.model_name = config.model + '_' + config.image_mode + '_' + str(config.image_size)
     out_dir = os.path.join(out_dir,config.model_name)
     initial_checkpoint = config.pretrained_model
-    criterion          = softmax_cross_entropy_criterion
+    criterion  = softmax_cross_entropy_criterion
 
     ## setup  -----------------------------------------------------------------------------
     if not os.path.exists(out_dir +'/checkpoint'):
@@ -44,21 +55,22 @@ def run_train(config):
 
     ## dataset ----------------------------------------
     log.write('** dataset setting **\n')
+    augment = get_augment(config.image_mode)
     train_dataset = FDDataset(mode = 'train', modality=config.image_mode,image_size=config.image_size,
-                              fold_index=config.train_fold_index)
+                              fold_index=config.train_fold_index,augment=augment)
     train_loader  = DataLoader(train_dataset,
                                 shuffle=True,
                                 batch_size  = config.batch_size,
                                 drop_last   = True,
-                                num_workers = 8)
+                                num_workers = 4)
 
     valid_dataset = FDDataset(mode = 'val', modality=config.image_mode,image_size=config.image_size,
-                              fold_index=config.train_fold_index)
+                              fold_index=config.train_fold_index,augment=augment)
     valid_loader  = DataLoader( valid_dataset,
                                 shuffle=False,
-                                batch_size  = config.batch_size // 36,
-                                drop_last   = False,
-                                num_workers = 8)
+                                batch_size = config.batch_size // 36,
+                                drop_last  = False,
+                                num_workers = 4)
 
     assert(len(train_dataset)>=config.batch_size)
     log.write('batch_size = %d\n'%(config.batch_size))
@@ -67,7 +79,7 @@ def run_train(config):
     log.write('\n')
     log.write('** net setting **\n')
 
-    net = get_model(model_name=config.model, num_class=2)
+    net = get_model(model_name=config.model, num_class=2, is_first_bn=True)
     print(net)
     net = torch.nn.DataParallel(net)
     net =  net.cuda()
@@ -91,11 +103,12 @@ def run_train(config):
     log.write('model_name   lr   iter  epoch     |     loss      acer      acc    |     loss              acc     |  time   \n')
     log.write('----------------------------------------------------------------------------------------------------\n')
 
-    train_loss   = np.zeros(6,np.float32)
-    valid_loss   = np.zeros(6,np.float32)
-    batch_loss   = np.zeros(6,np.float32)
     iter = 0
     i    = 0
+
+    train_loss = np.zeros(6, np.float32)
+    valid_loss = np.zeros(6, np.float32)
+    batch_loss = np.zeros(6, np.float32)
 
     start = timer()
     #-----------------------------------------------
@@ -126,6 +139,7 @@ def run_train(config):
 
             for input, truth in train_loader:
                 iter = i + start_iter
+
                 # one iteration update  -------------
                 net.train()
                 input = input.cuda()
@@ -143,17 +157,16 @@ def run_train(config):
 
                 # print statistics  ------------
                 batch_loss[:2] = np.array(( loss.item(), precision.item(),))
+
                 sum += 1
                 if iter%iter_smooth == 0:
                     train_loss = sum_train_loss/sum
                     sum = 0
-
-                i = i + 1
+                i=i+1
 
             if epoch >= config.cycle_inter // 2:
-            # if 1:
                 net.eval()
-                valid_loss, _ = do_valid_test(net, valid_loader, criterion)
+                valid_loss,_ = do_valid_test(net, valid_loader, criterion)
                 net.train()
 
                 if valid_loss[1] < min_acer and epoch > 0:
@@ -180,13 +193,14 @@ def run_train(config):
         log.write('save cycle ' + str(cycle_index) + ' final model \n')
 
 def run_test(config, dir):
-    config.model_name = config.model + '_' + config.image_mode + '_' + str(config.image_size)
     out_dir = './models'
+    config.model_name = config.model + '_' + config.image_mode + '_' + str(config.image_size)
     out_dir = os.path.join(out_dir,config.model_name)
     initial_checkpoint = config.pretrained_model
+    augment = get_augment(config.image_mode)
 
     ## net ---------------------------------------
-    net = get_model(model_name=config.model, num_class=2)
+    net = get_model(model_name=config.model, num_class=2, is_first_bn=True)
     net = torch.nn.DataParallel(net)
     net =  net.cuda()
 
@@ -198,8 +212,9 @@ def run_test(config, dir):
         if not os.path.exists(os.path.join(out_dir + '/checkpoint', dir)):
             os.makedirs(os.path.join(out_dir + '/checkpoint', dir))
 
+
     valid_dataset = FDDataset(mode = 'val', modality=config.image_mode,image_size=config.image_size,
-                              fold_index=config.train_fold_index)
+                              fold_index=config.train_fold_index,augment=augment)
     valid_loader  = DataLoader( valid_dataset,
                                 shuffle=False,
                                 batch_size  = config.batch_size,
@@ -207,7 +222,7 @@ def run_test(config, dir):
                                 num_workers=8)
 
     test_dataset = FDDataset(mode = 'test', modality=config.image_mode,image_size=config.image_size,
-                              fold_index=config.train_fold_index)
+                              fold_index=config.train_fold_index,augment=augment)
     test_loader  = DataLoader( test_dataset,
                                 shuffle=False,
                                 batch_size  = config.batch_size,
@@ -215,7 +230,6 @@ def run_test(config, dir):
                                 num_workers=8)
 
     criterion = softmax_cross_entropy_criterion
-    # 设置模型为eval模式
     net.eval()
 
     valid_loss,out = do_valid_test(net, valid_loader, criterion)
@@ -224,7 +238,6 @@ def run_test(config, dir):
     print('infer!!!!!!!!!')
     out = infer_test(net, test_loader)
     print('done')
-
     submission(out,save_dir+'_noTTA.txt', mode='test')
 
 def main(config):
@@ -235,13 +248,15 @@ def main(config):
         config.pretrained_model = r'global_min_acer_model.pth'
         run_test(config, dir='global_test_36_TTA')
 
+    return
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--train_fold_index', type=int, default = -1)
-    parser.add_argument('--model', type=str, default='baseline')
+
+    parser.add_argument('--model', type=str, default='model_A')
+    parser.add_argument('--image_mode', type=str, default='ir')
     parser.add_argument('--image_size', type=int, default=64)
-    parser.add_argument('--image_mode', type=str, default='fusion')
 
     parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--cycle_num', type=int, default=10)
